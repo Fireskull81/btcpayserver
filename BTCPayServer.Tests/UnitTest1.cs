@@ -46,7 +46,7 @@ using BTCPayServer.Services;
 using BTCPayServer.Services.Apps;
 using BTCPayServer.Services.Invoices;
 using BTCPayServer.Services.Labels;
-using BTCPayServer.Services.Mails;
+using BTCPayServer.Plugins.Emails.Services;
 using BTCPayServer.Services.Notifications;
 using BTCPayServer.Services.Rates;
 using BTCPayServer.Storage.Models;
@@ -76,8 +76,9 @@ using MarkPayoutRequest = BTCPayServer.Client.Models.MarkPayoutRequest;
 using RatesViewModel = BTCPayServer.Models.StoreViewModels.RatesViewModel;
 using Microsoft.Extensions.Caching.Memory;
 using PosViewType = BTCPayServer.Client.Models.PosViewType;
-using BTCPayServer.PaymentRequest;
+using BTCPayServer.Plugins.Emails.Controllers;
 using BTCPayServer.Views.Stores;
+using MimeKit;
 using NBXplorer.DerivationStrategy;
 
 namespace BTCPayServer.Tests
@@ -85,7 +86,7 @@ namespace BTCPayServer.Tests
     [Collection(nameof(NonParallelizableCollectionDefinition))]
     public class UnitTest1 : UnitTestBase
     {
-        public const int LongRunningTestTimeout = 60_000; // 60s
+        public const int LongRunningTestTimeout = TestUtils.LongRunningTestTimeout;
 
         public UnitTest1(ITestOutputHelper helper) : base(helper)
         {
@@ -1597,6 +1598,107 @@ namespace BTCPayServer.Tests
                 Assert.Equal(invoice.Id, payout.Destination);
                 Assert.Equal(-0.5m, payout.OriginalAmount);
             });
+        }
+
+        [Fact]
+        [Trait("FastTest", "FastTest")]
+        public void TestMailTemplate()
+        {
+            var template = new TextTemplate("Hello mister {Name.Firstname} {Name.Lastname} !");
+
+            // Happy path
+            JObject model = new()
+            {
+                ["Name"] = new JObject
+                {
+                    ["Firstname"] = "John",
+                    ["Lastname"] = "Doe"
+                }
+            };
+            var result = template.Render(model);
+
+            // Null values are not rendered
+            Assert.Equal("Hello mister John Doe !", result);
+            model = new()
+            {
+                ["Name"] = new JObject
+                {
+                    ["Firstname"] = "John",
+                    ["Lastname"] = null
+                }
+            };
+            result = template.Render(model);
+            Assert.Equal("Hello mister John  !", result);
+
+            // No crash on missing fields
+            model = new()
+            {
+                ["Name"] = new JObject
+                {
+                    ["Firstname"] = "John",
+                }
+            };
+            result = template.Render(model);
+            Assert.Equal("Hello mister John [NotFound(Name.Lastname)] !", result);
+
+            // Is Case insensitive
+            model = new()
+            {
+                ["Name"] = new JObject
+                {
+                    ["firstname"] = "John",
+                }
+            };
+            result = template.Render(model);
+            Assert.Equal("Hello mister John [NotFound(Name.Lastname)] !", result);
+
+            model = new()
+            {
+                ["Name"] = new JObject
+                {
+                    ["Firstname"] = "John",
+                    ["Lastname"] = "Doe",
+                    ["NameInner"] = new JObject
+                    {
+                        ["Ogg"] = 2,
+                        ["Arr"] = new JArray {
+                            new JObject() { ["ItemName"] = "hello" },
+                            2,
+                            new JObject() { ["ItemName"] = "world" } }
+                    }
+                }
+            };
+            var paths = template.GetPaths(model);
+            Assert.Equal("{Name.Firstname}", paths[0]);
+            Assert.Equal("{Name.Lastname}", paths[1]);
+            Assert.Equal("{Name.NameInner.Ogg}", paths[2]);
+            Assert.Equal("{Name.NameInner.Arr[0].ItemName}", paths[3]);
+            Assert.Equal("{Name.NameInner.Arr[1]}", paths[4]);
+            Assert.Equal("{Name.NameInner.Arr[2].ItemName}", paths[5]);
+
+            model = new()
+            {
+                ["Name"] = new JObject
+                {
+                    ["Firstname"] = "John",
+                    ["Lastname"] = "Doe",
+                    ["NameInner"] = new JObject
+                    {
+                        ["Ogg"] = 2,
+                        ["Arr"] = new JArray {
+                            new JObject() { ["ItemName"] = "hello" },
+                            2,
+                            new JObject() { ["ItemName"] = "world" } }
+                    },
+                    ["nameInner"] = new JObject()
+                    {
+                        ["Ogg2"] = 3
+                    }
+                }
+            };
+            template = new TextTemplate("Hello mister {Name.NameInner.Ogg} {Name.NameInner.Ogg2} !");
+            result = template.Render(model);
+            Assert.Equal("Hello mister 2 3 !", result);
         }
 
         [Fact]
@@ -3215,51 +3317,6 @@ namespace BTCPayServer.Tests
             var settings = tester.PayTester.GetService<SettingsRepository>();
             await settings.UpdateSetting<MigrationSettings>(new MigrationSettings());
             await tester.PayTester.RestartStartupTask<MigrationStartupTask>();
-        }
-
-        [Fact(Timeout = LongRunningTestTimeout)]
-        [Trait("Integration", "Integration")]
-        public async Task EmailSenderTests()
-        {
-            using var tester = CreateServerTester(newDb: true);
-            await tester.StartAsync();
-
-            var acc = tester.NewAccount();
-            await acc.GrantAccessAsync(true);
-
-            var settings = tester.PayTester.GetService<SettingsRepository>();
-            var emailSenderFactory = tester.PayTester.GetService<EmailSenderFactory>();
-
-            Assert.Null(await Assert.IsType<ServerEmailSender>(await emailSenderFactory.GetEmailSender()).GetEmailSettings());
-            Assert.Null(await Assert.IsType<StoreEmailSender>(await emailSenderFactory.GetEmailSender(acc.StoreId)).GetEmailSettings());
-
-
-            await settings.UpdateSetting(new PoliciesSettings() { DisableStoresToUseServerEmailSettings = false });
-            await settings.UpdateSetting(new EmailSettings()
-            {
-                From = "admin@admin.com",
-                Login = "admin@admin.com",
-                Password = "admin@admin.com",
-                Port = 1234,
-                Server = "admin.com",
-            });
-            Assert.Equal("admin@admin.com", (await Assert.IsType<ServerEmailSender>(await emailSenderFactory.GetEmailSender()).GetEmailSettings()).Login);
-            Assert.Equal("admin@admin.com", (await Assert.IsType<StoreEmailSender>(await emailSenderFactory.GetEmailSender(acc.StoreId)).GetEmailSettings()).Login);
-
-            await settings.UpdateSetting(new PoliciesSettings() { DisableStoresToUseServerEmailSettings = true });
-            Assert.Equal("admin@admin.com", (await Assert.IsType<ServerEmailSender>(await emailSenderFactory.GetEmailSender()).GetEmailSettings()).Login);
-            Assert.Null(await Assert.IsType<StoreEmailSender>(await emailSenderFactory.GetEmailSender(acc.StoreId)).GetEmailSettings());
-
-            Assert.IsType<RedirectToActionResult>(await acc.GetController<UIStoresController>().StoreEmailSettings(acc.StoreId, new EmailsViewModel(new EmailSettings
-            {
-                From = "store@store.com",
-                Login = "store@store.com",
-                Password = "store@store.com",
-                Port = 1234,
-                Server = "store.com"
-            }), ""));
-
-            Assert.Equal("store@store.com", (await Assert.IsType<StoreEmailSender>(await emailSenderFactory.GetEmailSender(acc.StoreId)).GetEmailSettings()).Login);
         }
 
         [Fact(Timeout = TestUtils.TestTimeout)]

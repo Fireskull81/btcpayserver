@@ -9,7 +9,7 @@
 @model BTCPayServer.Models.PaymentRequestViewModels.ListPaymentRequestsViewModel
 @{
     Layout = "_Layout";
-    ViewData["Title"] = ViewLocalizer["Payment Requests"];
+    ViewData.SetLayoutModel(new("PaymentRequests", StringLocalizer["Payment Requests"]));
     var storeId = Context.GetStoreData().Id;
     var statusFilterCount = CountArrayFilter("status") + (HasBooleanFilter("includearchived") ? 1 : 0);
 }
@@ -87,7 +87,7 @@
                 <tr>
                     <th text-translate="true">Title</th>
                     <th class="date-col">
-                        <div class="d-flex align-items-center gap-1">
+                        <div class="d-flex align-items-center gap-3">
                             <span text-translate="true">Expiry</span>
                             <button type="button" class="btn btn-link p-0 switch-time-format only-for-js" title="@StringLocalizer["Switch date format"]">
                                 <vc:icon symbol="time" />
@@ -123,7 +123,7 @@
                             <div class="d-inline-flex align-items-center gap-3">
                                 <a asp-action="ViewPaymentRequest" asp-route-payReqId="@item.Id" id="PaymentRequest-@item.Id" target="_blank" text-translate="true">View</a>
                                 <button type="button" class="btn btn-link p-0 clipboard-button"
-                                        data-clipboard="@CallbackGenerator.PaymentRequestByIdLink(item.Id, this.Context.Request)"
+                                        data-clipboard="@CallbackGenerator.PaymentRequestByIdLink(item.Id)"
                                         title="Copy Link">
                                     <vc:icon symbol="actions-copy" />
                                 </button>

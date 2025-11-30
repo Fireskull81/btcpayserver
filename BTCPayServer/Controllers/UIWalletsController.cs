@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net.Mime;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BTCPayServer.Abstractions.Constants;
@@ -76,6 +77,7 @@ namespace BTCPayServer.Controllers
         private readonly DefaultRulesCollection _defaultRules;
         private readonly Dictionary<PaymentMethodId, ICheckoutModelExtension> _paymentModelExtensions;
         private readonly TransactionLinkProviders _transactionLinkProviders;
+        private readonly InvoiceRepository _invoiceRepository;
         private readonly PullPaymentHostedService _pullPaymentHostedService;
         private readonly WalletHistogramService _walletHistogramService;
 
@@ -109,6 +111,7 @@ namespace BTCPayServer.Controllers
             Dictionary<PaymentMethodId, ICheckoutModelExtension> paymentModelExtensions,
             IStringLocalizer stringLocalizer,
             TransactionLinkProviders transactionLinkProviders,
+            InvoiceRepository invoiceRepository,
             DisplayFormatter displayFormatter)
         {
             _pendingTransactionService = pendingTransactionService;
@@ -118,6 +121,7 @@ namespace BTCPayServer.Controllers
             _handlers = handlers;
             _paymentModelExtensions = paymentModelExtensions;
             _transactionLinkProviders = transactionLinkProviders;
+            _invoiceRepository = invoiceRepository;
             Repository = repo;
             WalletRepository = walletRepository;
             RateFetcher = rateProvider;
@@ -440,7 +444,7 @@ namespace BTCPayServer.Controllers
                 switch (model.Command)
                 {
                     case "createpending":
-                        await _pendingTransactionService.CreatePendingTransaction(walletId.StoreId, walletId.CryptoCode, psbt);
+                        await _pendingTransactionService.CreatePendingTransaction(walletId.StoreId, walletId.CryptoCode, psbt, Request.GetRequestBaseUrl());
                         return RedirectToWalletList(walletId);
                     default:
                         // case "sign":
@@ -621,6 +625,7 @@ namespace BTCPayServer.Controllers
             var model = new ListTransactionsViewModel { Skip = skip, Count = count };
 
             model.PendingTransactions = await _pendingTransactionService.GetPendingTransactions(walletId.CryptoCode, walletId.StoreId);
+            model.Rates = GetCurrentStore().GetStoreBlob().GetTrackedRates().ToList();
 
             model.Labels.AddRange(
                 (await WalletRepository.GetWalletLabels(walletId))
@@ -654,6 +659,7 @@ namespace BTCPayServer.Controllers
                     vm.Positive = tx.BalanceChange.GetValue(wallet.Network) >= 0;
                     vm.Balance = tx.BalanceChange.ShowMoney(wallet.Network);
                     vm.IsConfirmed = tx.Confirmations != 0;
+                    vm.HistoryLine = tx;
                     // If support isn't possible, we want the user to be able to click so he can see why it doesn't work
                     vm.CanBumpFee =
                         tx.Confirmations == 0 &&
@@ -663,11 +669,35 @@ namespace BTCPayServer.Controllers
                         var labels = _labelService.CreateTransactionTagModels(transactionInfo, Request);
                         vm.Tags.AddRange(labels);
                         vm.Comment = transactionInfo.Comment;
+                        vm.InvoiceId = transactionInfo.Attachments.FirstOrDefault(a => a.Type == WalletObjectData.Types.Invoice)?.Id;
+                        vm.WalletRateBook = transactionInfo.Rates;
                     }
 
                     if (labelFilter == null ||
                         vm.Tags.Any(l => l.Text.Equals(labelFilter, StringComparison.OrdinalIgnoreCase)))
                         model.Transactions.Add(vm);
+                }
+
+                var trackedCurrencies = GetCurrentStore().GetStoreBlob().GetTrackedRates();
+                var rates = await _invoiceRepository.GetRatesOfInvoices(model.Transactions.Select(r => r.InvoiceId).Where(r => r is not null).ToHashSet());
+                foreach (var vm in model.Transactions)
+                {
+                    if (vm.InvoiceId is null)
+                        continue;
+                    rates.TryGetValue(vm.InvoiceId, out var book);
+                    vm.InvoiceRateBook = book;
+                }
+
+                foreach (var vm in model.Transactions)
+                {
+                    var book = vm.InvoiceRateBook ?? new();
+                    if (vm.WalletRateBook is not null)
+                        book.AddRates(vm.WalletRateBook);
+                    foreach (var trackedCurrency in trackedCurrencies)
+                    {
+                        var exists = book.TryGetRate(new CurrencyPair(network.CryptoCode, trackedCurrency), out var rate);
+                        vm.Rates.Add(exists ?  _displayFormatter.Currency(rate, trackedCurrency) : null);
+                    }
                 }
 
                 model.Total = preFiltering ? null : model.Transactions.Count;
@@ -1260,10 +1290,13 @@ namespace BTCPayServer.Controllers
                 ChangeAddress = psbtResponse.ChangeAddress?.ToString(),
                 PSBT = psbt.ToHex()
             };
+
+            if (!psbt.IsReadyToSign() && command == "sign")
+                command = "analyze-psbt";
             switch (command)
             {
                 case "createpending":
-                    await _pendingTransactionService.CreatePendingTransaction(walletId.StoreId, walletId.CryptoCode, psbt);
+                    await _pendingTransactionService.CreatePendingTransaction(walletId.StoreId, walletId.CryptoCode, psbt, Request.GetRequestBaseUrl());
                     return RedirectToAction(nameof(WalletTransactions), new { walletId = walletId.ToString() });
                 case "sign":
                     return await WalletSign(walletId, new WalletPSBTViewModel
@@ -1483,9 +1516,9 @@ namespace BTCPayServer.Controllers
 
             var psbt = PSBT.Parse(viewModel.SigningContext.PSBT, network.NBitcoinNetwork);
 
-            if (!psbt.IsReadyToSign())
+            if (!psbt.IsReadyToSign(out var errors))
             {
-                ModelState.AddModelError(nameof(viewModel.SigningContext.PSBT), "PSBT is not ready to be signed");
+                ModelState.AddModelError(nameof(viewModel.SigningContext.PSBT), BuildErrorMessage(errors));
             }
 
             if (!ModelState.IsValid)
@@ -1549,6 +1582,27 @@ namespace BTCPayServer.Controllers
                 ReturnUrl = viewModel.ReturnUrl,
                 BackUrl = viewModel.BackUrl
             });
+        }
+
+        private static string BuildErrorMessage(PSBTError[] errors)
+        {
+            StringBuilder errorMessage = new();
+            errorMessage.Append("PSBT is not ready to be signed.");
+            if (errors.Length == 1)
+            {
+                errorMessage.Append($" ({errors[0]})");
+            }
+            else
+            {
+                errorMessage.AppendLine();
+                foreach (var error in errors.Take(5))
+                {
+                    errorMessage.AppendLine(error.ToString());
+                }
+            }
+            if (errors.Length > 5)
+                errorMessage.Append($"{errors.Length - 5} more errors...");
+            return errorMessage.ToString();
         }
 
         private WalletPSBTReadyViewModel.StringAmounts ValueToString(Money v, BTCPayNetworkBase network,

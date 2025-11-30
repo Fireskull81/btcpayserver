@@ -15,6 +15,7 @@ using BTCPayServer.Plugins.PointOfSale;
 using BTCPayServer.Plugins.PointOfSale.Controllers;
 using BTCPayServer.Plugins.PointOfSale.Models;
 using BTCPayServer.Services.Apps;
+using BTCPayServer.Tests.PMO;
 using BTCPayServer.Views.Stores;
 using LNURL;
 using Microsoft.AspNetCore.Mvc;
@@ -147,7 +148,7 @@ fruit tea:
         }
 
         [Fact]
-        [Trait("Integration", "Integration")]
+        [Trait("Playwright", "Playwright")]
         public async Task CanExportInvoicesWithMetadata()
         {
             await using var s = CreatePlaywrightTester();
@@ -220,16 +221,10 @@ fruit tea:
             }
 
             await s.GoToInvoices(s.StoreId);
-            await s.Page.ClickAsync("#view-report");
+            await s.ClickViewReport();
 
-            await s.Page.WaitForSelectorAsync($"xpath=//*[text()=\"{freeInvoiceId}\"]");
-
-            var download = await s.Page.RunAndWaitForDownloadAsync(async () =>
-            {
-                await s.ClickPagePrimary();
-            });
-            var csvTxt = await new StreamReader(await download.CreateReadStreamAsync()).ReadToEndAsync();
-            var csvTester = CSVTester.ParseCSV(csvTxt);
+            var csvTxt = await s.DownloadReportCSV();
+            var csvTester = new CSVInvoicesTester(csvTxt);
             csvTester
                 .ForInvoice(posInvoiceId)
                 .AssertCount(2)
@@ -275,61 +270,13 @@ fruit tea:
                     ("PaymentCurrency", "BTC"),
                     ("PaymentAmount", "0.40000000"),
                     ("PaymentInvoiceAmount", "2000.00"),
-                    ("Rate", "5000"))
+                    ("PaymentRate", "5000"))
                 .SelectPayment(1)
                 .AssertValues(
                     ("InvoiceStatus", ""),
                     ("PaymentCurrency", "BTC"),
                     ("PaymentAmount", "0.60000000"),
-                    ("Rate", "5000"));
-        }
-
-        class CSVTester
-        {
-            public static CSVTester ParseCSV(string csvText) => new(csvText);
-            private readonly Dictionary<string, int> _indexes;
-            private string invoice = "";
-            private int payment = 0;
-            private readonly List<string[]> _lines;
-
-            public CSVTester(string text)
-            {
-                var lines = text.Split("\r\n").ToList();
-                var headers = lines[0].Split(',');
-                _indexes = headers.Select((h,i) => (h,i)).ToDictionary(h => h.h, h => h.i);
-                _lines = lines.Skip(1).ToList().Select(l => l.Split(',')).ToList();
-            }
-
-            public CSVTester ForInvoice(string invoice)
-            {
-                this.payment = 0;
-                this.invoice = invoice;
-                return this;
-            }
-            public CSVTester SelectPayment(int payment)
-            {
-                this.payment = payment;
-                return this;
-            }
-            public CSVTester AssertCount(int count)
-            {
-                Assert.Equal(count, _lines
-                    .Count(l => l[_indexes["InvoiceId"]] == invoice));
-                return this;
-            }
-
-            public CSVTester AssertValues(params (string, string)[] values)
-            {
-                var payments = _lines
-                    .Where(l => l[_indexes["InvoiceId"]] == invoice)
-                    .ToArray();
-                var line = payments[payment];
-                foreach (var (key, value) in values)
-                {
-                    Assert.Equal(value, line[_indexes[key]]);
-                }
-                return this;
-            }
+                    ("PaymentRate", "5000"));
         }
 
         [Fact(Timeout = LongRunningTestTimeout)]
@@ -774,12 +721,8 @@ goodies:
             await s.GoToInvoiceCheckout();
         }
 
-        private static async Task AssertInvoiceAmount(PlaywrightTester s, string expectedAmount)
-        {
-            var el = await s.Page.WaitForSelectorAsync("#AmountDue");
-            var content = await el!.TextContentAsync();
-            Assert.Equal(expectedAmount.NormalizeWhitespaces(), content.NormalizeWhitespaces());
-        }
+        private static Task AssertInvoiceAmount(PlaywrightTester s, string expectedAmount)
+            => new InvoiceCheckoutPMO(s).AssertContent(new() { AmountDue = expectedAmount });
 
         [Fact]
         [Trait("Playwright", "Playwright")]
